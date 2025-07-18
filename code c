@@ -1,0 +1,241 @@
+#include <TinyGPS++.h>
+#include <SoftwareSerial.h>
+#include <Wire.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_SSD1306.h>
+
+#define SCREEN_WIDTH 128
+#define SCREEN_HEIGHT 64
+#define OLED_RESET -1
+Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
+
+#define BUTTON_PIN D5    
+#define BUZZER_PIN D6    
+#define GSM_RX D7        
+#define GSM_TX D8        
+#define GPS_RX D3        
+#define GPS_TX D4        
+
+String phoneNumbers[] = {"6206837215", "9131519743"}; 
+const int numberCount = 2; 
+
+SoftwareSerial gsmSerial(GSM_TX, GSM_RX); 
+SoftwareSerial gpsSerial(GPS_TX, GPS_RX); 
+TinyGPSPlus gps;
+
+unsigned long buttonPressTime = 0;
+bool buttonPressed = false;
+bool longPressDetected = false;
+
+void setup() {
+  Serial.begin(115200);
+  while (!Serial) { ; }
+  Serial.println(F("Device is starting..."));
+  
+  gsmSerial.begin(9600);
+  gpsSerial.begin(9600);
+
+  pinMode(BUTTON_PIN, INPUT_PULLUP); 
+  pinMode(BUZZER_PIN, OUTPUT);
+  digitalWrite(BUZZER_PIN, LOW);
+  Serial.println(F("Pins initialized"));
+
+  if (!display.begin(SSD1306_SWITCHCAPVCC, 0x3C)) {
+    Serial.println(F("SSD1306 allocation failed"));
+    for (;;);
+  }
+  Serial.println(F("OLED initialized"));
+  updateDisplay("Welcome", "Women Safety");
+  delay(4000);
+  updateDisplay("System", "Ready...");
+
+  delay(1000);
+  updateDisplay("GSM", "Init...");
+  Serial.println(F("Initializing SIM800L..."));
+  String atResponse = sendATCommand("AT", "OK", 2000);
+  if (atResponse.indexOf("OK") != -1) {
+    Serial.println(F("SIM800L response: OK"));
+  } else {
+    Serial.println(F("SIM800L response failed: ") + atResponse);
+  }
+
+  sendATCommand("ATE0", "OK", 2000);
+  sendATCommand("AT+CMGF=1", "OK", 2000);
+  
+  String reg = sendATCommand("AT+CREG?", "+CREG: 0,1", 10000);
+  if (reg.indexOf("+CREG: 0,1") != -1 || reg.indexOf("+CREG: 0,5") != -1) {
+    Serial.println(F("Network registered"));
+  } else {
+    Serial.println(F("Network not registered: ") + reg);
+    updateDisplay("GSM", "No Network");
+    delay(2000);
+  }
+
+  String csq = sendATCommand("AT+CSQ", "+CSQ:", 2000);
+  Serial.println("Signal Strength: " + csq);
+  updateDisplay("GSM", "Ready..");
+  delay(1000);
+  updateDisplay("System", "Ready..");
+}
+
+void loop() {
+  while (gpsSerial.available() > 0) {
+    gps.encode(gpsSerial.read());
+  }
+
+  if (digitalRead(BUTTON_PIN) == LOW && !buttonPressed) {
+    buttonPressed = true;
+    buttonPressTime = millis();
+    longPressDetected = false;
+    Serial.println(F("Button Pressed"));
+  }
+  else if (digitalRead(BUTTON_PIN) == LOW && buttonPressed) {
+    if (millis() - buttonPressTime >= 4000 && !longPressDetected) {
+      longPressDetected = true;
+      Serial.println(F("Long Press Detected: Emergency Triggered"));
+      activateEmergency();
+    }
+  }
+  else if (digitalRead(BUTTON_PIN) == HIGH && buttonPressed) {
+    buttonPressed = false;
+    longPressDetected = false;
+    updateDisplay("System", "Ready");
+    Serial.println(F("Button Released"));
+  }
+}
+
+void updateDisplay(String line1, String line2) {
+  display.clearDisplay();
+  display.setTextSize(2);
+  display.setTextColor(SSD1306_WHITE);
+
+  int16_t x1, y1;
+  uint16_t w, h;
+  display.getTextBounds(line1, 0, 0, &x1, &y1, &w, &h);
+  int x = (SCREEN_WIDTH - w) / 2;
+  display.setCursor(x, 16);
+  display.println(line1);
+
+  display.getTextBounds(line2, 0, 0, &x1, &y1, &w, &h);
+  x = (SCREEN_WIDTH - w) / 2;
+  display.setCursor(x, 32);
+  display.println(line2);
+
+  display.display();
+  Serial.println("OLED Updated: " + line1 + " / " + line2);
+}
+
+void activateEmergency() {
+  digitalWrite(BUZZER_PIN, HIGH);
+  updateDisplay("Emergency", "Activated");
+  Serial.println(F("Emergency Activated: Buzzer ON"));
+  delay(1000);
+
+  updateDisplay("Tracking", "Location");
+  String location = getLocation();
+  
+  if (location != "Location not found") {
+    updateDisplay("Location", "Found");
+    Serial.println(F("Location Found: ") + location);
+  } else {
+    updateDisplay("Location", "Not Found");
+    Serial.println(F("Location Not Found"));
+  }
+  delay(1000);
+
+  String message = "HELP ME Location: " + location;
+  for (int i = 0; i < numberCount; i++) {
+    String normalizedNumber = phoneNumbers[i];
+    if (!normalizedNumber.startsWith("+91")) {
+      normalizedNumber = "+91" + normalizedNumber;
+    }
+    Serial.println("Normalized Number: " + normalizedNumber);
+    
+    updateDisplay("Calling", normalizedNumber.substring(0, 11));
+    String callResult = makeCall(normalizedNumber);
+    Serial.println("Call Result (" + normalizedNumber + "): " + callResult);
+    
+    updateDisplay("Sending", "SMS");
+    String smsResult = sendSMS(normalizedNumber, message);
+    Serial.println("SMS Result (" + normalizedNumber + "): " + smsResult);
+  }
+
+  updateDisplay("Call & SMS", "Sent");
+  Serial.println(F("Call and SMS sent"));
+  delay(5000);
+  
+  digitalWrite(BUZZER_PIN, LOW);
+  updateDisplay("System", "Ready");
+  Serial.println(F("Buzzer OFF, System Ready"));
+}
+
+String getLocation() {
+  Serial.println(F("Getting GPS Location..."));
+  unsigned long startTime = millis();
+  while (millis() - startTime < 10000) {
+    while (gpsSerial.available() > 0) {
+      gps.encode(gpsSerial.read());
+      if (gps.location.isValid()) {
+        String lat = String(gps.location.lat(), 6);
+        String lng = String(gps.location.lng(), 6);
+        String link = "https://maps.google.com/?q=" + lat + "," + lng;
+        Serial.println("GPS Link: " + link);
+        return link;
+      }
+    }
+  }
+  return "Location not found";
+}
+
+String makeCall(String number) {
+  Serial.println("Calling: " + number);
+  String result = sendATCommand("AT", "OK", 2000);
+  if (result.indexOf("OK") == -1) {
+    Serial.println("Module not responding: " + result);
+    return result;
+  }
+
+  result = sendATCommand("ATD" + number + ";", "OK", 15000);
+  if (result.indexOf("OK") != -1) {
+    Serial.println("Call Started");
+    for (int i = 0; i < 20; i++) {
+      updateDisplay("Calling", number.substring(0, 11));
+      delay(1000);
+    }
+    result = sendATCommand("ATH", "OK", 2000);
+    Serial.println("Hang Up: " + result);
+  } else {
+    Serial.println("Call Failed: " + result);
+  }
+  return result;
+}
+
+String sendSMS(String number, String message) {
+  Serial.println("Starting SMS to: " + number);
+  String result = sendATCommand("AT+CMGF=1", "OK", 2000);
+  if (result.indexOf("OK") == -1) {
+    Serial.println("SMS mode set failed: " + result);
+    return result;
+  }
+
+  result = sendATCommand("AT+CMGS=\"" + number + "\"", ">", 10000);
+  if (result.indexOf(">") != -1) {
+    Serial.println("Sending SMS: " + message);
+    gsmSerial.print(message);
+    delay(100);
+    gsmSerial.write((char)26); 
+    result = sendATCommand("", "OK", 20000);
+    if (result.indexOf("OK") != -1) {
+      Serial.println("SMS sent successfully: " + number);
+    } else {
+      Serial.println("SMS send failed: " + result);
+    }
+  } else {
+    Serial.println("Failed to get SMS prompt: " + result);
+  }
+  return result;
+}
+
+String sendATCommand(String command, String response, int timeout) {
+  String result = "";
+  if (command != "")
